@@ -1,0 +1,135 @@
+name: Minecraft Server (ngrok)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_players:
+        description: 'Max players'
+        required: false
+        default: '20'
+      runtime_hours:
+        description: 'How long to run (hours)'
+        required: false
+        default: '6'
+
+jobs:
+  minecraft-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Create server directory
+        run: mkdir -p minecraft-server
+
+      - name: Download Minecraft server
+        run: |
+          cd minecraft-server
+          wget https://piston-data.mojang.com/v1/objects/95495a7f485eedd84ce928cef5e223b757d2f764/server.jar -O server.jar
+
+      - name: Accept EULA
+        run: echo "eula=true" > minecraft-server/eula.txt
+
+      - name: Configure server
+        run: |
+          cat > minecraft-server/server.properties << EOF
+          motd=Gitcraft Server (this is literally on github actions LOL)
+          server-port=25565
+          max-players=${{ github.event.inputs.max_players || '20' }}
+          online-mode=true
+          pvp=true
+          difficulty=normal
+          gamemode=survival
+          spawn-protection=0
+          EOF
+
+      - name: Setup ngrok
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update
+          sudo apt install ngrok -y
+
+      - name: Configure ngrok
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          if [ -z "$NGROK_AUTH_TOKEN" ]; then
+            echo "ERROR: NGROK_AUTH_TOKEN secret not set!"
+            echo "Please add your ngrok auth token as a GitHub secret"
+            echo "Get your token from: https://dashboard.ngrok.com/get-started/your-authtoken"
+            exit 1
+          fi
+          ngrok config add-authtoken $NGROK_AUTH_TOKEN
+
+      - name: Start ngrok tunnel
+        run: |
+          ngrok tcp 25565 --log=stdout > ngrok.log &
+          echo $! > ngrok.pid
+          sleep 5
+
+      - name: Get ngrok URL
+        run: |
+          echo "Fetching ngrok tunnel URL..."
+          sleep 3
+          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url' | sed 's/tcp:\/\///')
+          echo "=========================================="
+          echo "Connection Address: $NGROK_URL"
+          echo "=========================================="
+          echo "NGROK_URL=$NGROK_URL" >> $GITHUB_ENV
+
+      - name: Start Minecraft server
+        run: |
+          cd minecraft-server
+          java -Xmx2G -Xms1G -jar server.jar nogui > ../server.log 2>&1 &
+          echo $! > ../server.pid
+
+      - name: Wait for server to start
+        run: |
+          echo "Waiting for server to initialize..."
+          sleep 30
+          echo "Server should be running now!"
+
+      - name: Display connection info
+        run: |
+          echo "=========================================="
+          echo "Connection Address: $NGROK_URL"
+          echo "Server will run for ${{ github.event.inputs.runtime_hours || '6' }} hours"
+          echo "=========================================="
+
+      - name: Monitor server
+        run: |
+          runtime_seconds=$((${{ github.event.inputs.runtime_hours || '6' }} * 3600))
+          end_time=$(($(date +%s) + runtime_seconds))
+
+          while [ $(date +%s) -lt $end_time ]; do
+            if ! ps -p $(cat server.pid) > /dev/null 2>&1; then
+              echo "Server process died! Check logs:"
+              tail -n 50 server.log
+              exit 1
+            fi
+            echo "Server still running... $(((end_time - $(date +%s)) / 60)) minutes remaining"
+            sleep 300
+          done
+
+      - name: Shutdown server
+        if: always()
+        run: |
+          echo "Shutting down server..."
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) || true
+          fi
+          if [ -f ngrok.pid ]; then
+            kill $(cat ngrok.pid) || true
+          fi
+          echo "Server stopped!"
+          echo "Final server log:"
+          tail -n 20 server.log || true
